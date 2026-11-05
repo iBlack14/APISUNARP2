@@ -31,7 +31,8 @@ La imagen principal puede construirse desde la raíz con `docker build -t consul
 proporciona las variables al contenedor en tiempo de ejecución, no durante el build.
 En EasyPanel u otro panel, configura el puerto interno `8000` y usa el Dockerfile
 de la raíz. Uvicorn escribe los logs de arranque y acceso en la salida del
-contenedor; el healthcheck consulta `/health` cada 30 segundos.
+contenedor; el healthcheck consulta `/health` cada 30 segundos. Chromium se
+ejecuta en modo headless, sin requerir Xvfb.
 
 Ejecuta las pruebas unitarias seguras (no consultan la base de datos) con
 `python -m unittest -v`.

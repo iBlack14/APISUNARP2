@@ -169,7 +169,7 @@ async def get_browser():
     if _browser is None or not _browser.is_connected():
         _pw = await async_playwright().start()
         _browser = await _pw.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
