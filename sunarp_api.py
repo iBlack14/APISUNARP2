@@ -10,12 +10,14 @@ getDatosVehiculo. Una consulta a la vez (lock) para no saturar.
 """
 
 import asyncio
-import json
+import hmac
 import logging
+import os
 import re
-import sys
+import threading
+import time
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 
@@ -30,9 +32,44 @@ API_URL = (
 IP_URL = "https://api.ipify.org/?format=json"
 
 app = FastAPI(title="SUNARP Consulta Vehicular", version="1.0")
+API_KEY = os.environ.get("API_KEY", "").strip()
+RATE_LIMIT = 60
+RATE_WINDOW_SECONDS = 60
+_rate_lock = threading.Lock()
+_rate_window_started = 0.0
+_rate_count = 0
 _lock = asyncio.Lock()
 _browser = None
 _pw = None
+
+
+def require_api_key(
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> None:
+    if len(API_KEY) < 32:
+        raise HTTPException(503, "Autenticación no configurada correctamente.")
+    if api_key is None or not hmac.compare_digest(
+        api_key.encode("utf-8"), API_KEY.encode("utf-8")
+    ):
+        raise HTTPException(
+            401, "No autorizado.", headers={"WWW-Authenticate": "ApiKey"}
+        )
+
+    global _rate_count, _rate_window_started
+    now = time.monotonic()
+    with _rate_lock:
+        elapsed = now - _rate_window_started
+        if elapsed >= RATE_WINDOW_SECONDS:
+            _rate_window_started = now
+            _rate_count = 0
+        if _rate_count >= RATE_LIMIT:
+            retry_after = max(1, int(RATE_WINDOW_SECONDS - elapsed))
+            raise HTTPException(
+                429,
+                "Límite de consultas excedido.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        _rate_count += 1
 
 
 async def get_browser():
@@ -144,7 +181,7 @@ async def health():
 
 
 @app.post("/consulta")
-async def consulta(req: ConsultaIn):
+async def consulta(req: ConsultaIn, _: None = Depends(require_api_key)):
     placa = req.placa.strip().upper().replace(" ", "")
     if not re.fullmatch(r"[A-Z0-9]{4,8}", placa):
         raise HTTPException(400, "Placa invalida")
@@ -152,11 +189,13 @@ async def consulta(req: ConsultaIn):
     async with _lock:
         try:
             result = await consultar(placa)
-        except TimeoutError as e:
-            raise HTTPException(504, str(e))
-        except Exception as e:
+        except TimeoutError as exc:
+            raise HTTPException(
+                504, "Tiempo de espera agotado al consultar SUNARP."
+            ) from exc
+        except Exception:
             log.exception("Error en consulta")
-            raise HTTPException(502, f"Error consultando SUNARP: {e}")
+            raise HTTPException(502, "Error consultando SUNARP.")
 
     data = result.get("data", {})
     model = data.get("model") or {}

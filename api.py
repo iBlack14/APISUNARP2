@@ -4,29 +4,38 @@ API unificada: RENIEC (DNI) + SUNARP (placa vehicular).
 
 Endpoints:
   GET  /health
-  GET  /reniec/consulta/{dni}
   POST /reniec/consulta          {"dni": "12345678"}
   POST /sunarp/consulta          {"placa": "ABC123"}
 
 Variables de entorno:
   DATABASE_URL  (requerida para RENIEC)
+  API_KEY       (clave de acceso, mínimo 32 caracteres)
 """
 
 import asyncio
+import hmac
 import logging
 import os
 import re
+import threading
+import time
 
-import psycopg2
-import psycopg2.extras
-from fastapi import FastAPI, HTTPException
+import psycopg
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
+from psycopg.rows import dict_row
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("api")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+API_KEY = os.environ.get("API_KEY", "").strip()
+RATE_LIMIT = 60
+RATE_WINDOW_SECONDS = 60
+_rate_lock = threading.Lock()
+_rate_window_started = 0.0
+_rate_count = 0
 
 PAGE_URL = "https://consultavehicular.sunarp.gob.pe/consulta-vehicular/inicio"
 SUNARP_API_URL = (
@@ -42,7 +51,38 @@ SEXO_MAP = {"1": "Masculino", "2": "Femenino", "M": "Masculino", "F": "Femenino"
 # ---------------------------------------------------------------- RENIEC --
 
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    return psycopg.connect(
+        DATABASE_URL, connect_timeout=10, sslmode="verify-full"
+    )
+
+
+def require_api_key(
+    api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> None:
+    if len(API_KEY) < 32:
+        raise HTTPException(503, "Autenticación no configurada correctamente.")
+    if api_key is None or not hmac.compare_digest(
+        api_key.encode("utf-8"), API_KEY.encode("utf-8")
+    ):
+        raise HTTPException(
+            401, "No autorizado.", headers={"WWW-Authenticate": "ApiKey"}
+        )
+
+    global _rate_count, _rate_window_started
+    now = time.monotonic()
+    with _rate_lock:
+        elapsed = now - _rate_window_started
+        if elapsed >= RATE_WINDOW_SECONDS:
+            _rate_window_started = now
+            _rate_count = 0
+        if _rate_count >= RATE_LIMIT:
+            retry_after = max(1, int(RATE_WINDOW_SECONDS - elapsed))
+            raise HTTPException(
+                429,
+                "Límite de consultas excedido.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        _rate_count += 1
 
 
 def parse_ubigeo_dir(ubigeo_dir: str):
@@ -88,17 +128,12 @@ def validar_dni(dni: str) -> str:
     return dni
 
 
-@app.get("/reniec/consulta/{dni}")
-def reniec_get(dni: str):
-    return reniec_por_dni(dni)
-
-
 class ReniecIn(BaseModel):
     dni: str
 
 
 @app.post("/reniec/consulta")
-def reniec_post(req: ReniecIn):
+def reniec_post(req: ReniecIn, _: None = Depends(require_api_key)):
     return reniec_por_dni(req.dni)
 
 
@@ -108,17 +143,18 @@ def reniec_por_dni(dni: str):
     dni = validar_dni(dni)
     try:
         conn = get_conn()
-    except Exception as e:
-        raise HTTPException(503, f"Base de datos no disponible: {e}")
+    except Exception:
+        log.exception("No se pudo conectar a la base de datos RENIEC")
+        raise HTTPException(503, "Base de datos no disponible.")
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute('SELECT * FROM public.reniec WHERE "DNI" = %s', (dni,))
             row = cur.fetchone()
     finally:
         conn.close()
     if not row:
         raise HTTPException(404, "DNI no encontrado")
-    return row_to_response(dict(row))
+    return row_to_response(row)
 
 
 # ---------------------------------------------------------------- SUNARP --
@@ -231,7 +267,7 @@ class SunarpIn(BaseModel):
 
 
 @app.post("/sunarp/consulta")
-async def sunarp_post(req: SunarpIn):
+async def sunarp_post(req: SunarpIn, _: None = Depends(require_api_key)):
     placa = req.placa.strip().upper().replace(" ", "")
     if not re.fullmatch(r"[A-Z0-9]{4,8}", placa):
         raise HTTPException(400, "Placa invalida")
@@ -239,11 +275,13 @@ async def sunarp_post(req: SunarpIn):
     async with _lock:
         try:
             result = await sunarp_consultar(placa)
-        except TimeoutError as e:
-            raise HTTPException(504, str(e))
-        except Exception as e:
+        except TimeoutError as exc:
+            raise HTTPException(
+                504, "Tiempo de espera agotado al consultar SUNARP."
+            ) from exc
+        except Exception:
             log.exception("Error en consulta SUNARP")
-            raise HTTPException(502, f"Error consultando SUNARP: {e}")
+            raise HTTPException(502, "Error consultando SUNARP.")
 
     data = result.get("data", {})
     model = data.get("model") or {}
@@ -255,7 +293,7 @@ async def sunarp_post(req: SunarpIn):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "reniec": bool(DATABASE_URL)}
+    return {"status": "ok"}
 
 
 @app.on_event("shutdown")
