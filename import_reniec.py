@@ -59,7 +59,7 @@ def get_connection() -> psycopg.Connection:
     conninfo = os.environ.get("DATABASE_URL", "").strip()
     if not conninfo:
         raise ValueError("Configura DATABASE_URL en el archivo .env antes de continuar.")
-    return psycopg.connect(conninfo, sslmode="verify-full")
+    return psycopg.connect(conninfo, sslmode="disable")
 
 
 def read_header(file_path: Path) -> list[str]:

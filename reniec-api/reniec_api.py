@@ -40,7 +40,7 @@ SEXO_MAP = {"1": "Masculino", "2": "Femenino", "M": "Masculino", "F": "Femenino"
 
 def get_conn():
     return psycopg.connect(
-        DATABASE_URL, connect_timeout=10, sslmode="verify-full"
+        DATABASE_URL, connect_timeout=10, sslmode="disable"
     )
 
 

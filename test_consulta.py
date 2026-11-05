@@ -45,7 +45,7 @@ class ConsultaValidationTests(unittest.TestCase):
         ):
             api.get_conn()
         connect.assert_called_once_with(
-            "postgresql://example/db", connect_timeout=10, sslmode="verify-full"
+            "postgresql://example/db", connect_timeout=10, sslmode="disable"
         )
 
     def test_weak_api_key_configuration_fails_closed(self):

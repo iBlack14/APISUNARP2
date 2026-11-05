@@ -12,7 +12,7 @@ def main() -> int:
 
     try:
         with psycopg.connect(
-            database_url, connect_timeout=10, sslmode="verify-full"
+            database_url, connect_timeout=10, sslmode="disable"
         ) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(

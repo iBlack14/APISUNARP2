@@ -7,9 +7,9 @@
    `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 3. La clave debe tener al menos 32 caracteres. No guardes el `.env` en Git ni
    incluyas credenciales en imágenes Docker.
-4. Las conexiones PostgreSQL requieren TLS con verificación del certificado
-   (`verify-full`). Configura `PGSSLROOTCERT` con el certificado CA del proveedor
-   cuando no esté disponible en el sistema.
+4. PostgreSQL se conecta sin SSL (`sslmode=disable`) para ser compatible con
+   servidores que no ofrecen TLS. Usa esta configuración solo si la base de
+   datos es accesible exclusivamente por una red privada confiable.
 
 La API combinada ofrece `POST /reniec/consulta` y `POST /sunarp/consulta`.
 La API RENIEC independiente ofrece `POST /consulta`; el servicio SUNARP
@@ -21,7 +21,8 @@ gateway o proxy.
 
 Envía el DNI en el cuerpo JSON del POST, no en la URL. Publica el servicio solo
 detrás de un proxy HTTPS; el puerto de la API no cifra por sí mismo el tráfico
-del cliente.
+del cliente. La conexión API-PostgreSQL tampoco cifra datos; no expongas el
+puerto de PostgreSQL a Internet.
 
 ## Ejecución y pruebas
 
