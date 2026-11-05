@@ -1,35 +1,128 @@
 #!/usr/bin/env python3
 """
-API REST para consulta vehicular SUNARP.
+API unificada: RENIEC (DNI) + SUNARP (placa vehicular).
 
-POST /consulta  {"placa": "1274UP"}  -> resultado JSON
-GET  /health                              -> {"status": "ok"}
+Endpoints:
+  GET  /health
+  GET  /reniec/consulta/{dni}
+  POST /reniec/consulta          {"dni": "12345678"}
+  POST /sunarp/consulta          {"placa": "ABC123"}
 
-Cada consulta abre una sesion Playwright, resuelve Turnstile y llama
-getDatosVehiculo. Una consulta a la vez (lock) para no saturar.
+Variables de entorno:
+  DATABASE_URL  (requerida para RENIEC)
 """
 
 import asyncio
-import json
 import logging
+import os
 import re
-import sys
 
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("sunarp-api")
+log = logging.getLogger("api")
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 PAGE_URL = "https://consultavehicular.sunarp.gob.pe/consulta-vehicular/inicio"
-API_URL = (
+SUNARP_API_URL = (
     "https://api-gateway.sunarp.gob.pe:9443/sunarp/multiservicios/"
     "multiservicio-consvehicular/consulta/getDatosVehiculo"
 )
 IP_URL = "https://api.ipify.org/?format=json"
 
-app = FastAPI(title="SUNARP Consulta Vehicular", version="1.0")
+app = FastAPI(title="API Consultas", version="1.0")
+
+SEXO_MAP = {"1": "Masculino", "2": "Femenino", "M": "Masculino", "F": "Femenino"}
+
+# ---------------------------------------------------------------- RENIEC --
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+
+
+def parse_ubigeo_dir(ubigeo_dir: str):
+    parts = (ubigeo_dir or "").split("-")
+    if len(parts) >= 3:
+        return parts[0].strip(), parts[1].strip(), "-".join(parts[2:]).strip()
+    return "", "", ""
+
+
+def row_to_response(row: dict) -> dict:
+    dep, prov, dist = parse_ubigeo_dir(row.get("UBIGEO_DIR") or "")
+    sexo_raw = (row.get("SEXO") or "").strip()
+    return {
+        "dni": row.get("DNI"),
+        "apellido_paterno": row.get("AP_PAT"),
+        "apellido_materno": row.get("AP_MAT"),
+        "nombres": row.get("NOMBRES"),
+        "nombre_completo": " ".join(
+            p for p in [row.get("NOMBRES"), row.get("AP_PAT"), row.get("AP_MAT")] if p
+        ),
+        "fecha_nacimiento": row.get("FECHA_NAC"),
+        "sexo": SEXO_MAP.get(sexo_raw.upper(), sexo_raw),
+        "estado_civil": row.get("EST_CIVIL"),
+        "direccion": row.get("DIRECCION"),
+        "departamento": dep,
+        "provincia": prov,
+        "distrito": dist,
+        "ubigeo_nacimiento": row.get("UBIGEO_NAC"),
+        "ubigeo_direccion": row.get("UBIGEO_DIR"),
+        "fecha_inscripcion": row.get("FCH_INSCRIPCION"),
+        "fecha_emision": row.get("FCH_EMISION"),
+        "fecha_caducidad": row.get("FCH_CADUCIDAD"),
+        "dig_ruc": row.get("DIG_RUC"),
+        "madre": row.get("MADRE"),
+        "padre": row.get("PADRE"),
+    }
+
+
+def validar_dni(dni: str) -> str:
+    dni = dni.strip()
+    if not re.fullmatch(r"\d{8}", dni):
+        raise HTTPException(400, "DNI debe tener 8 digitos")
+    return dni
+
+
+@app.get("/reniec/consulta/{dni}")
+def reniec_get(dni: str):
+    return reniec_por_dni(dni)
+
+
+class ReniecIn(BaseModel):
+    dni: str
+
+
+@app.post("/reniec/consulta")
+def reniec_post(req: ReniecIn):
+    return reniec_por_dni(req.dni)
+
+
+def reniec_por_dni(dni: str):
+    if not DATABASE_URL:
+        raise HTTPException(503, "DATABASE_URL no configurada")
+    dni = validar_dni(dni)
+    try:
+        conn = get_conn()
+    except Exception as e:
+        raise HTTPException(503, f"Base de datos no disponible: {e}")
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute('SELECT * FROM public.reniec WHERE "DNI" = %s', (dni,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(404, "DNI no encontrado")
+    return row_to_response(dict(row))
+
+
+# ---------------------------------------------------------------- SUNARP --
+
 _lock = asyncio.Lock()
 _browser = None
 _pw = None
@@ -70,7 +163,6 @@ async def get_turnstile_token(page, timeout_s: int = 90) -> str:
         )
         if token:
             return token
-        # Intentar click en el checkbox del widget Turnstile (una sola vez)
         if not clicked and loop.time() > deadline - timeout_s + 8:
             clicked = True
             try:
@@ -83,7 +175,7 @@ async def get_turnstile_token(page, timeout_s: int = 90) -> str:
     raise TimeoutError("Turnstile no genero token")
 
 
-async def consultar(placa: str) -> dict:
+async def sunarp_consultar(placa: str) -> dict:
     browser = await get_browser()
     context = await browser.new_context(
         user_agent=(
@@ -127,44 +219,43 @@ async def consultar(placa: str) -> dict:
                 });
                 return {status: r.status, data: await r.json()};
             }""",
-            {"url": API_URL, "body": body},
+            {"url": SUNARP_API_URL, "body": body},
         )
         return result
     finally:
         await context.close()
 
 
-class ConsultaIn(BaseModel):
+class SunarpIn(BaseModel):
     placa: str
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-@app.post("/consulta")
-async def consulta(req: ConsultaIn):
+@app.post("/sunarp/consulta")
+async def sunarp_post(req: SunarpIn):
     placa = req.placa.strip().upper().replace(" ", "")
     if not re.fullmatch(r"[A-Z0-9]{4,8}", placa):
         raise HTTPException(400, "Placa invalida")
 
     async with _lock:
         try:
-            result = await consultar(placa)
+            result = await sunarp_consultar(placa)
         except TimeoutError as e:
             raise HTTPException(504, str(e))
         except Exception as e:
-            log.exception("Error en consulta")
+            log.exception("Error en consulta SUNARP")
             raise HTTPException(502, f"Error consultando SUNARP: {e}")
 
     data = result.get("data", {})
     model = data.get("model") or {}
-    # Quitar la imagen base64 del response para no saturar
     if "imagen" in model:
         model = {k: v for k, v in model.items() if k != "imagen"}
         data = {**data, "model": model}
     return {"http": result.get("status"), "sunarp": data}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "reniec": bool(DATABASE_URL)}
 
 
 @app.on_event("shutdown")
