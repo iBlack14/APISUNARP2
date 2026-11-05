@@ -40,11 +40,13 @@ async def get_browser():
     if _browser is None or not _browser.is_connected():
         _pw = await async_playwright().start()
         _browser = await _pw.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-size=1366,768",
             ],
         )
     return _browser
@@ -53,6 +55,7 @@ async def get_browser():
 async def get_turnstile_token(page, timeout_s: int = 90) -> str:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout_s
+    clicked = False
     while loop.time() < deadline:
         token = await page.evaluate(
             """() => {
@@ -67,6 +70,15 @@ async def get_turnstile_token(page, timeout_s: int = 90) -> str:
         )
         if token:
             return token
+        # Intentar click en el checkbox del widget Turnstile (una sola vez)
+        if not clicked and loop.time() > deadline - timeout_s + 8:
+            clicked = True
+            try:
+                frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+                await frame.locator('input[type="checkbox"], .cb-lb, body').first.click(timeout=3000)
+                log.info("Click en widget Turnstile ejecutado")
+            except Exception as e:
+                log.info("No se pudo clickear Turnstile: %s", e)
         await asyncio.sleep(1)
     raise TimeoutError("Turnstile no genero token")
 
