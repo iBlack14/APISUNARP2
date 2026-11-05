@@ -1,0 +1,10 @@
+.env
+__pycache__/
+.venv/
+reniec.rar
+reniec/
+traffic.log
+sunarp_index.html
+chunk-*.js
+main-*.js
+*.log
