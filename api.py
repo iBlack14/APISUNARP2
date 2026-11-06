@@ -262,10 +262,6 @@ async def procesar_consulta_sunarp(placa_raw: str) -> dict:
         raise HTTPException(502, f"Error en la consulta del worker: {exc}") from exc
 
     data = result.get("data", {})
-    model = data.get("model") or {}
-    if "imagen" in model:
-        model = {k: v for k, v in model.items() if k != "imagen"}
-        data = {**data, "model": model}
     return {"http": result.get("status"), "sunarp": data}
 
 
