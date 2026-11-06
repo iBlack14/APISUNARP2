@@ -193,6 +193,8 @@ async def sunarp_consultar(placa: str) -> dict:
         f"--user-data-dir={CHROME_PROFILE}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
         PAGE_URL,
     ])
     try:
