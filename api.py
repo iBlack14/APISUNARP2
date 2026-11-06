@@ -406,6 +406,25 @@ def health():
     }
 
 
+@app.get("/health/db")
+def health_db():
+    if not DATABASE_URL:
+        raise HTTPException(503, "DATABASE_URL no configurada")
+
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        finally:
+            conn.close()
+    except psycopg.Error as exc:
+        log.exception("No se pudo verificar la conexión a la base de datos")
+        raise HTTPException(503, "Base de datos no disponible.") from exc
+
+    return {"status": "ok", "database": "connected"}
+
+
 @app.on_event("shutdown")
 async def shutdown():
     pass

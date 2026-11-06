@@ -7,6 +7,11 @@
    `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 3. Para los workers distribuidos, define `WORKER_SECRET` (una clave compartida entre el VPS y tus PCs).
 
+`GET /health` comprueba que la API responde. `GET /health/db` comprueba también
+la conexión con PostgreSQL y devuelve `503` si `DATABASE_URL` no está configurada
+o la base de datos no está disponible. El `HEALTHCHECK` de Docker usa este
+segundo endpoint.
+
 ---
 
 ## Arquitectura Master-Worker (24/7 en la nube)
