@@ -10,3 +10,8 @@ sunarp_index.html
 chunk-*.js
 main-*.js
 *.log
+debug_*
+captured_requests.json
+test_*.py
+check_*.py
+*.png
