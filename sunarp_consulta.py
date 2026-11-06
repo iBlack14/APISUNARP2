@@ -37,7 +37,19 @@ API_URL = (
 IP_URL = "https://api.ipify.org/?format=json"
 
 # Bright Data Scraping Browser
-BRD_SBR_ENDPOINT = os.environ.get("BRD_SBR_ENDPOINT", "").strip()
+def format_sbr_endpoint(endpoint: str) -> str:
+    ep = (endpoint or "").strip()
+    if not ep:
+        return ""
+    if ep.startswith("wss://") or ep.startswith("ws://"):
+        return ep
+    parts = ep.split(":")
+    if len(parts) == 4:
+        host, port, user, password = parts
+        return f"wss://{user}:{password}@{host}:{port}"
+    return f"wss://{ep}"
+
+BRD_SBR_ENDPOINT = format_sbr_endpoint(os.environ.get("BRD_SBR_ENDPOINT", ""))
 USE_BRIGHT_DATA = bool(BRD_SBR_ENDPOINT)
 
 # Configuracion Chrome local (solo para modo LOCAL)
@@ -76,25 +88,18 @@ async def get_token_cdp(page, timeout_s: int) -> str:
 # ---------------------------------------------------------------------------
 
 async def consultar_bright_data(placa: str, timeout_s: int) -> dict:
-    """Consulta usando el Scraping Browser de Bright Data (sin Chrome local)."""
-    print(f"[*] Conectando a Bright Data Scraping Browser...")
+    """Consulta usando el Navegador remoto (ZenRows / Bright Data)."""
+    print(f"[*] Conectando al navegador remoto (ZenRows)...", flush=True)
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(BRD_SBR_ENDPOINT)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 768},
-            locale="es-PE",
-        )
-        page = await context.new_page()
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        page = context.pages[0] if context.pages else await context.new_page()
         try:
-            await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
-            print("[*] Esperando resolucion automatica de Cloudflare Turnstile (Bright Data)...")
+            print(f"[*] Abriendo {PAGE_URL}...", flush=True)
+            await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=120000)
+            print("[*] Esperando resolucion automatica de Cloudflare Turnstile...", flush=True)
             token = await get_token_cdp(page, timeout_s)
-            print(f"[+] Token obtenido ({len(token)} chars)")
+            print(f"[+] Token obtenido ({len(token)} chars)", flush=True)
 
             ip = await page.evaluate(
                 f"""async () => {{
@@ -105,7 +110,7 @@ async def consultar_bright_data(placa: str, timeout_s: int) -> dict:
                     }} catch(e) {{ return '0.0.0.0'; }}
                 }}"""
             )
-            print(f"[*] IP de salida (Bright Data): {ip}")
+            print(f"[*] IP de salida: {ip}", flush=True)
 
             placa_clean = placa.strip().upper().replace(" ", "")
             body = {
@@ -117,7 +122,7 @@ async def consultar_bright_data(placa: str, timeout_s: int) -> dict:
                 "dG9rZW4": token,
             }
 
-            print(f"[*] Consultando placa {placa_clean}...")
+            print(f"[*] Consultando placa {placa_clean}...", flush=True)
             result = await page.evaluate(
                 """async ({url, body}) => {
                     const r = await fetch(url, {
@@ -134,7 +139,6 @@ async def consultar_bright_data(placa: str, timeout_s: int) -> dict:
             )
             return result
         finally:
-            await context.close()
             await browser.close()
 
 

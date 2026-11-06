@@ -15,3 +15,9 @@ captured_requests.json
 test_*.py
 check_*.py
 *.png
+
+# PyInstaller & Build artifacts
+build/
+dist/
+*.spec
+*.exe

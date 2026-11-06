@@ -22,6 +22,10 @@ import os
 import re
 import threading
 import time
+import uuid
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -37,13 +41,26 @@ API_URL = (
 )
 IP_URL = "https://api.ipify.org/?format=json"
 
+def format_sbr_endpoint(endpoint: str) -> str:
+    ep = (endpoint or "").strip()
+    if not ep:
+        return ""
+    if ep.startswith("wss://") or ep.startswith("ws://"):
+        return ep
+    parts = ep.split(":")
+    if len(parts) == 4:
+        host, port, user, password = parts
+        return f"wss://{user}:{password}@{host}:{port}"
+    return f"wss://{ep}"
+
 # Bright Data Scraping Browser endpoint (wss://user:pass@brd.superproxy.io:9222)
-# Si esta vacio, se usa Chromium local.
-BRD_SBR_ENDPOINT = os.environ.get("BRD_SBR_ENDPOINT", "").strip()
+BRD_SBR_ENDPOINT = format_sbr_endpoint(os.environ.get("BRD_SBR_ENDPOINT", ""))
 USE_BRIGHT_DATA = bool(BRD_SBR_ENDPOINT)
 
 app = FastAPI(title="SUNARP Consulta Vehicular", version="1.0")
 API_KEY = os.environ.get("API_KEY", "").strip()
+WORKER_SECRET = os.environ.get("WORKER_SECRET", "mi_super_secreto_worker_123").strip()
+
 RATE_LIMIT = 60
 RATE_WINDOW_SECONDS = 60
 _rate_lock = threading.Lock()
@@ -51,7 +68,12 @@ _rate_window_started = 0.0
 _rate_count = 0
 _lock = asyncio.Lock()
 
-# Estado del browser local (no aplica en modo Bright Data, que es stateless)
+# Cola y tareas para arquitectura Master-Worker
+_task_queue = asyncio.Queue()
+_pending_tasks = {}  # task_id -> {"placa": str, "future": asyncio.Future, "created_at": float}
+_last_worker_seen = 0.0
+
+# Estado del browser local
 _browser = None
 _pw = None
 
@@ -156,18 +178,11 @@ async def consultar(placa: str) -> dict:
     """
     async with async_playwright() as p:
         if USE_BRIGHT_DATA:
-            log.info("Usando Bright Data Scraping Browser para placa %s", placa)
+            log.info("Usando navegador remoto (ZenRows) para placa %s", placa)
             browser = await p.chromium.connect_over_cdp(BRD_SBR_ENDPOINT)
-            # Bright Data crea el contexto por defecto; usamos uno nuevo limpio
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1366, "height": 768},
-                locale="es-PE",
-            )
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = context.pages[0] if context.pages else await context.new_page()
+            is_remote = True
         else:
             log.info("Usando Chromium local para placa %s", placa)
             browser = await _get_local_browser()
@@ -180,10 +195,11 @@ async def consultar(placa: str) -> dict:
                 viewport={"width": 1366, "height": 768},
                 locale="es-PE",
             )
+            page = await context.new_page()
+            is_remote = False
 
-        page = await context.new_page()
         try:
-            await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=120000)
             token = await get_turnstile_token(page)
             log.info("Turnstile token OK (%d chars)", len(token))
 
@@ -218,25 +234,97 @@ async def consultar(placa: str) -> dict:
             )
             return result
         finally:
-            await context.close()
-            if USE_BRIGHT_DATA:
-                # En Bright Data cada sesion CDP es independiente; cerramos
+            if is_remote:
                 await browser.close()
+            else:
+                await context.close()
 
 
 # ---------------------------------------------------------------------------
 # Endpoints FastAPI
 # ---------------------------------------------------------------------------
 
+def require_worker_secret(
+    x_worker_secret: str | None = Header(default=None, alias="X-Worker-Secret")
+) -> None:
+    if not x_worker_secret or not hmac.compare_digest(
+        x_worker_secret.encode("utf-8"), WORKER_SECRET.encode("utf-8")
+    ):
+        raise HTTPException(401, "Worker no autorizado.")
+
+
 class ConsultaIn(BaseModel):
     placa: str
 
 
+class WorkerResultIn(BaseModel):
+    task_id: str
+    status: int
+    data: dict
+    error: str | None = None
+
+
 @app.get("/health")
 async def health():
-    modo = "bright_data" if USE_BRIGHT_DATA else "local"
-    return {"status": "ok", "browser_mode": modo}
+    now = time.time()
+    worker_online = (now - _last_worker_seen) < 30.0
+    modo = "worker_distribuido" if worker_online else ("bright_data" if USE_BRIGHT_DATA else "local")
+    return {
+        "status": "ok",
+        "browser_mode": modo,
+        "worker_online": worker_online,
+        "tareas_en_cola": _task_queue.qsize(),
+    }
 
+
+# --- Endpoints para la arquitectura Worker Distribuido ---
+
+@app.get("/worker/tarea")
+async def worker_get_task(_: None = Depends(require_worker_secret)):
+    """El worker (ej. en tu PC) consulta si hay tareas pendientes."""
+    global _last_worker_seen
+    _last_worker_seen = time.time()
+    try:
+        task_id = await asyncio.wait_for(_task_queue.get(), timeout=15.0)
+        task_info = _pending_tasks.get(task_id)
+        if not task_info or task_info["future"].done():
+            return {"tarea": None}
+        return {"tarea": {"task_id": task_id, "placa": task_info["placa"]}}
+    except asyncio.TimeoutError:
+        return {"tarea": None}
+
+
+@app.post("/worker/resultado")
+async def worker_post_result(req: WorkerResultIn, _: None = Depends(require_worker_secret)):
+    """El worker entrega los datos de la consulta."""
+    global _last_worker_seen
+    _last_worker_seen = time.time()
+    task_info = _pending_tasks.pop(req.task_id, None)
+    if not task_info:
+        return {"ok": False, "msg": "Tarea no encontrada o ya finalizada"}
+
+    future = task_info["future"]
+    if not future.done():
+        if req.error:
+            future.set_exception(RuntimeError(req.error))
+        else:
+            future.set_result({"status": req.status, "data": req.data})
+    return {"ok": True}
+
+
+@app.get("/worker/status")
+async def worker_status():
+    """Estado de los workers conectados."""
+    now = time.time()
+    return {
+        "worker_activo": (now - _last_worker_seen) < 30.0,
+        "segundos_desde_ultimo_worker": round(now - _last_worker_seen, 1) if _last_worker_seen else None,
+        "tareas_en_cola": _task_queue.qsize(),
+        "tareas_pendientes": len(_pending_tasks),
+    }
+
+
+# --- Endpoint principal de consulta ---
 
 @app.post("/consulta")
 async def consulta(req: ConsultaIn, _: None = Depends(require_api_key)):
@@ -244,16 +332,36 @@ async def consulta(req: ConsultaIn, _: None = Depends(require_api_key)):
     if not re.fullmatch(r"[A-Z0-9]{4,8}", placa):
         raise HTTPException(400, "Placa invalida")
 
-    async with _lock:
+    now = time.time()
+    # Si hay un worker activo (visto en los ultimos 45 segundos), delegamos la tarea a la PC local
+    if (now - _last_worker_seen) < 45.0:
+        task_id = str(uuid.uuid4())
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        _pending_tasks[task_id] = {"placa": placa, "future": future, "created_at": now}
+        await _task_queue.put(task_id)
+        log.info("Tarea %s asignada a la cola de workers para placa %s", task_id, placa)
+
         try:
-            result = await consultar(placa)
-        except TimeoutError as exc:
-            raise HTTPException(
-                504, "Tiempo de espera agotado al consultar SUNARP."
-            ) from exc
-        except Exception:
-            log.exception("Error en consulta")
-            raise HTTPException(502, "Error consultando SUNARP.")
+            result = await asyncio.wait_for(future, timeout=90.0)
+        except asyncio.TimeoutError:
+            _pending_tasks.pop(task_id, None)
+            raise HTTPException(504, "El worker no respondio en el tiempo limite (90s).")
+        except Exception as exc:
+            log.exception("Error reportado por el worker")
+            raise HTTPException(502, f"Error en la consulta del worker: {exc}")
+    else:
+        # Fallback local o remoto
+        async with _lock:
+            try:
+                result = await consultar(placa)
+            except TimeoutError as exc:
+                raise HTTPException(
+                    504, "Tiempo de espera agotado al consultar SUNARP."
+                ) from exc
+            except Exception:
+                log.exception("Error en consulta")
+                raise HTTPException(502, "Error consultando SUNARP.")
 
     data = result.get("data", {})
     model = data.get("model") or {}

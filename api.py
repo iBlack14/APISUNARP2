@@ -6,10 +6,17 @@ Endpoints:
   GET  /health
   POST /reniec/consulta          {"dni": "12345678"}
   POST /sunarp/consulta          {"placa": "ABC123"}
+  POST /consulta                 {"placa": "ABC123"}  (alias)
+
+Endpoints de Workers (Master-Worker):
+  GET  /worker/tarea             (el worker solicita tareas pendientes)
+  POST /worker/resultado         (el worker entrega la respuesta)
+  GET  /worker/status            (estado de workers conectados)
 
 Variables de entorno:
-  DATABASE_URL  (requerida para RENIEC)
-  API_KEY       (clave de acceso, mínimo 32 caracteres)
+  DATABASE_URL   (requerida para RENIEC)
+  API_KEY        (clave de acceso para clientes, mínimo 32 caracteres)
+  WORKER_SECRET  (clave secreta compartida entre VPS y Workers)
 """
 
 import asyncio
@@ -20,6 +27,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 
 import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -32,11 +40,18 @@ log = logging.getLogger("api")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 API_KEY = os.environ.get("API_KEY", "").strip()
+WORKER_SECRET = os.environ.get("WORKER_SECRET", "mi_super_secreto_worker_123").strip()
+
 RATE_LIMIT = 60
 RATE_WINDOW_SECONDS = 60
 _rate_lock = threading.Lock()
 _rate_window_started = 0.0
 _rate_count = 0
+
+# Cola y estado para arquitectura Master-Worker
+_task_queue = asyncio.Queue()
+_pending_tasks = {}  # task_id -> {"placa": str, "future": asyncio.Future, "created_at": float}
+_last_worker_seen = 0.0
 
 PAGE_URL = "https://consultavehicular.sunarp.gob.pe/consulta-vehicular/inicio"
 SUNARP_API_URL = (
@@ -54,6 +69,7 @@ SUNARP_CLIENT_ID = "70574c7d9194834316a156b1d68fdb90"
 app = FastAPI(title="API Consultas", version="1.0")
 
 SEXO_MAP = {"1": "Masculino", "2": "Femenino", "M": "Masculino", "F": "Femenino"}
+
 
 # ---------------------------------------------------------------- RENIEC --
 
@@ -90,6 +106,15 @@ def require_api_key(
                 headers={"Retry-After": str(retry_after)},
             )
         _rate_count += 1
+
+
+def require_worker_secret(
+    x_worker_secret: str | None = Header(default=None, alias="X-Worker-Secret")
+) -> None:
+    if not x_worker_secret or not hmac.compare_digest(
+        x_worker_secret.encode("utf-8"), WORKER_SECRET.encode("utf-8")
+    ):
+        raise HTTPException(401, "Worker no autorizado.")
 
 
 def parse_ubigeo_dir(ubigeo_dir: str):
@@ -186,7 +211,7 @@ async def get_turnstile_token_cdp(page, timeout_s: int = 90) -> str:
 
 
 async def sunarp_consultar(placa: str) -> dict:
-    """Lanza Chrome real con CDP y conecta Playwright (evita deteccion Turnstile)."""
+    """Fallback local: lanza Chrome real con CDP."""
     chrome = subprocess.Popen([
         CHROME_PATH,
         f"--remote-debugging-port={CDP_PORT}",
@@ -259,22 +284,97 @@ class SunarpIn(BaseModel):
     placa: str
 
 
-@app.post("/sunarp/consulta")
-async def sunarp_post(req: SunarpIn, _: None = Depends(require_api_key)):
-    placa = req.placa.strip().upper().replace(" ", "")
+class WorkerResultIn(BaseModel):
+    task_id: str
+    status: int
+    data: dict
+    error: str | None = None
+
+
+# --- Endpoints de Workers (Master-Worker) ---
+
+@app.get("/worker/tarea")
+async def worker_get_task(_: None = Depends(require_worker_secret)):
+    """El worker (ej. en tu PC) consulta si hay tareas pendientes."""
+    global _last_worker_seen
+    _last_worker_seen = time.time()
+    try:
+        task_id = await asyncio.wait_for(_task_queue.get(), timeout=15.0)
+        task_info = _pending_tasks.get(task_id)
+        if not task_info or task_info["future"].done():
+            return {"tarea": None}
+        return {"tarea": {"task_id": task_id, "placa": task_info["placa"]}}
+    except asyncio.TimeoutError:
+        return {"tarea": None}
+
+
+@app.post("/worker/resultado")
+async def worker_post_result(req: WorkerResultIn, _: None = Depends(require_worker_secret)):
+    """El worker entrega los datos de la consulta."""
+    global _last_worker_seen
+    _last_worker_seen = time.time()
+    task_info = _pending_tasks.pop(req.task_id, None)
+    if not task_info:
+        return {"ok": False, "msg": "Tarea no encontrada o ya finalizada"}
+
+    future = task_info["future"]
+    if not future.done():
+        if req.error:
+            future.set_exception(RuntimeError(req.error))
+        else:
+            future.set_result({"status": req.status, "data": req.data})
+    return {"ok": True}
+
+
+@app.get("/worker/status")
+async def worker_status():
+    """Estado de los workers conectados."""
+    now = time.time()
+    return {
+        "worker_activo": (now - _last_worker_seen) < 30.0,
+        "segundos_desde_ultimo_worker": round(now - _last_worker_seen, 1) if _last_worker_seen else None,
+        "tareas_en_cola": _task_queue.qsize(),
+        "tareas_pendientes": len(_pending_tasks),
+    }
+
+
+# --- Endpoint principal de consulta vehicular ---
+
+async def procesar_consulta_sunarp(placa_raw: str) -> dict:
+    placa = placa_raw.strip().upper().replace(" ", "")
     if not re.fullmatch(r"[A-Z0-9]{4,8}", placa):
         raise HTTPException(400, "Placa invalida")
 
-    async with _lock:
+    now = time.time()
+    # Si hay un worker activo en los últimos 45 segundos, delegamos al worker
+    if (now - _last_worker_seen) < 45.0:
+        task_id = str(uuid.uuid4())
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        _pending_tasks[task_id] = {"placa": placa, "future": future, "created_at": now}
+        await _task_queue.put(task_id)
+        log.info("Tarea %s asignada a la cola de workers para placa %s", task_id, placa)
+
         try:
-            result = await sunarp_consultar(placa)
-        except TimeoutError as exc:
-            raise HTTPException(
-                504, "Tiempo de espera agotado al consultar SUNARP."
-            ) from exc
-        except Exception:
-            log.exception("Error en consulta SUNARP")
-            raise HTTPException(502, "Error consultando SUNARP.")
+            result = await asyncio.wait_for(future, timeout=90.0)
+        except asyncio.TimeoutError:
+            _pending_tasks.pop(task_id, None)
+            raise HTTPException(504, "El worker no respondio en el tiempo limite (90s).")
+        except Exception as exc:
+            log.exception("Error reportado por el worker")
+            raise HTTPException(502, f"Error en la consulta del worker: {exc}")
+    else:
+        # Fallback local
+        async with _lock:
+            try:
+                result = await sunarp_consultar(placa)
+            except TimeoutError as exc:
+                raise HTTPException(
+                    504, "Tiempo de espera agotado al consultar SUNARP."
+                ) from exc
+            except Exception:
+                log.exception("Error en consulta SUNARP")
+                raise HTTPException(502, "Error consultando SUNARP.")
 
     data = result.get("data", {})
     model = data.get("model") or {}
@@ -284,9 +384,26 @@ async def sunarp_post(req: SunarpIn, _: None = Depends(require_api_key)):
     return {"http": result.get("status"), "sunarp": data}
 
 
+@app.post("/sunarp/consulta")
+async def sunarp_post(req: SunarpIn, _: None = Depends(require_api_key)):
+    return await procesar_consulta_sunarp(req.placa)
+
+
+@app.post("/consulta")
+async def consulta_alias(req: SunarpIn, _: None = Depends(require_api_key)):
+    """Alias para compatibilidad con clientes que llaman /consulta."""
+    return await procesar_consulta_sunarp(req.placa)
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    now = time.time()
+    worker_online = (now - _last_worker_seen) < 30.0
+    return {
+        "status": "ok",
+        "worker_online": worker_online,
+        "tareas_en_cola": _task_queue.qsize(),
+    }
 
 
 @app.on_event("shutdown")
