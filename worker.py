@@ -12,6 +12,9 @@ Uso:
 """
 
 import asyncio
+import base64
+import binascii
+import io
 import json
 import logging
 import os
@@ -19,6 +22,7 @@ import ssl
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.request
 import urllib.error
 
@@ -77,6 +81,146 @@ CHROME_PATH = os.environ.get(
     "CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 )
 CHROME_PROFILE = os.environ.get("CHROME_PROFILE", r"C:\chrome-debug-profile")
+_OCR_ENGINE = None
+
+
+def _normalize_ocr_text(value: str) -> tuple[str, list[int]]:
+    normalized = []
+    positions = []
+    for index, character in enumerate(value.upper()):
+        decomposed = unicodedata.normalize("NFKD", character)
+        for part in decomposed:
+            if part.isalnum():
+                normalized.append(part)
+                positions.append(index)
+    return "".join(normalized), positions
+
+
+_OCR_LABELS = {
+    "placa_anterior": ("PLACAANTERIOR",),
+    "placa_vigente": ("PLACAVIGENTE",),
+    "propietarios": ("PROPIETARIOS", "PROPIETARIO"),
+    "anio_fabricacion": ("ANODEFABRICACION", "ANODEFAB", "ANIODEFAB"),
+    "anio_modelo": ("ANODEMODELO", "ANODEM0DELO", "ANOMODELO"),
+    "numero_partida": ("NUMERODEPARTIDA", "NPARTIDA"),
+    "categoria": ("CATEGORIA",),
+    "cilindrada": ("CILINDRADA",),
+    "combustible": ("COMBUSTIBLE",),
+    "carroceria": ("CARROCERIA",),
+    "potencia": ("POTENCIA",),
+    "numero_placa": ("NPLACA", "PLACAN"),
+    "numero_serie": ("NSERIE", "SERIE"),
+    "numero_vin": ("NVIN", "VIN"),
+    "numero_motor": ("NMOTOR", "MOTOR"),
+    "anotaciones": ("ANOTACIONES",),
+    "estado": ("ESTADO",),
+    "modelo": ("MODELO",),
+    "marca": ("MARCA",),
+    "color": ("COLOR",),
+    "sede": ("SEDE",),
+}
+
+
+def _ocr_label_and_value(text: str) -> tuple[str | None, str]:
+    normalized, positions = _normalize_ocr_text(text)
+    for field, aliases in _OCR_LABELS.items():
+        for alias in aliases:
+            if normalized.startswith(alias):
+                end = positions[len(alias)] if len(positions) > len(alias) else len(text)
+                return field, text[end:].lstrip(" \t:;.-")
+    return None, ""
+
+
+def parse_vehicle_ocr_texts(texts: list[str]) -> dict[str, str | list[str]]:
+    fields: dict[str, str | list[str]] = {}
+    pending_field = None
+
+    def save_field(field: str, value: str) -> None:
+        if field == "propietarios":
+            fields[field] = [value]
+        else:
+            fields[field] = value
+
+    for text in texts:
+        if pending_field:
+            normalized, _ = _normalize_ocr_text(text)
+            exact_label = any(
+                normalized == alias
+                for aliases in _OCR_LABELS.values()
+                for alias in aliases
+            )
+            if not exact_label and text.strip():
+                save_field(pending_field, text.strip())
+                pending_field = None
+                continue
+
+        field, value = _ocr_label_and_value(text)
+        if field:
+            if value:
+                save_field(field, value.strip())
+                pending_field = None
+            else:
+                pending_field = field
+            continue
+
+        if pending_field and text.strip():
+            save_field(pending_field, text.strip())
+            pending_field = None
+
+    return fields
+
+
+def reconocer_imagen_vehicular(image_data: str) -> dict:
+    """Reconoce localmente la imagen base64 de SUNARP y organiza sus campos."""
+    try:
+        encoded = image_data.split(",", 1)[1] if image_data.startswith("data:") else image_data
+        if len(encoded) > 28 * 1024 * 1024:
+            raise ValueError("Tamaño de imagen superior a 20 MB")
+        image_bytes = base64.b64decode(encoded, validate=True)
+        if not image_bytes or len(image_bytes) > 20 * 1024 * 1024:
+            raise ValueError("Tamaño de imagen vacío o superior a 20 MB")
+
+        from PIL import Image
+        import numpy as np
+        from rapidocr_onnxruntime import RapidOCR
+
+        global _OCR_ENGINE
+        if _OCR_ENGINE is None:
+            _OCR_ENGINE = RapidOCR()
+
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image_array = np.asarray(image.convert("RGB"))
+        results, _ = _OCR_ENGINE(image_array)
+        texts = [str(item[1]).strip() for item in (results or []) if item[1]]
+        if not texts:
+            return {"estado": "sin_texto", "campos": {}, "texto": ""}
+
+        fields = parse_vehicle_ocr_texts(texts)
+        return {
+            "estado": "ok" if fields else "sin_campos",
+            "campos": fields,
+            "texto": "\n".join(texts),
+        }
+    except (binascii.Error, ValueError) as exc:
+        log.exception("La imagen recibida de SUNARP no se pudo interpretar")
+        return {"estado": "error", "mensaje": str(exc), "campos": {}, "texto": ""}
+    except Exception as exc:
+        log.exception("Falló el OCR local de la imagen de SUNARP")
+        return {"estado": "error", "mensaje": str(exc), "campos": {}, "texto": ""}
+
+
+def agregar_ocr_a_resultado(result: dict) -> dict:
+    data = result.get("data") or {}
+    model = data.get("model") or {}
+    image = model.get("imagen") if isinstance(model, dict) else None
+    if not isinstance(image, str) or not image:
+        return result
+
+    ocr = reconocer_imagen_vehicular(image)
+    safe_model = {key: value for key, value in model.items() if key != "imagen"}
+    result["data"] = {**data, "model": safe_model, "ocr": ocr}
+    log.info("OCR SUNARP: estado=%s, campos=%d", ocr["estado"], len(ocr["campos"]))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +257,7 @@ async def consultar_placa(placa: str, timeout_s: int = 90) -> dict:
         "--no-default-browser-check",
         PAGE_URL,
     ])
+    browser = None
     try:
         await asyncio.sleep(6)
         async with async_playwright() as p:
@@ -161,10 +306,21 @@ async def consultar_placa(placa: str, timeout_s: int = 90) -> dict:
                 }""",
                 {"url": API_URL, "body": body},
             )
-            await browser.close()
-            return result
+            return agregar_ocr_a_resultado(result)
     finally:
-        chrome.terminate()
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                log.exception("No se pudo cerrar el navegador Playwright")
+        if chrome.poll() is None:
+            chrome.terminate()
+            try:
+                chrome.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log.warning("Chrome no termino; se forzara su cierre")
+                chrome.kill()
+                chrome.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -269,4 +425,3 @@ async def main_loop():
 
 if __name__ == "__main__":
     asyncio.run(main_loop())
-

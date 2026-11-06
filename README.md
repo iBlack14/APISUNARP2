@@ -46,16 +46,23 @@ En cada máquina en Perú (puedes tener 1, 2 o más PCs encendidas):
    VPS_URL=https://tu-vps.com
    WORKER_SECRET=tu_clave_secreta_aqui
    ```
-2. Ejecuta el worker haciendo doble clic en `iniciar_worker.bat` o:
+2. Para ejecutar desde Python, instala las dependencias del worker (incluye OCR local):
+   ```bash
+   pip install -r requirements-worker.txt
+   ```
+3. Ejecuta el worker haciendo doble clic en `iniciar_worker.bat` o:
    ```bash
    python worker.py
    ```
+El worker aplica OCR localmente a la imagen devuelta por SUNARP y agrega
+`sunarp.ocr.campos` y `sunarp.ocr.texto` a la respuesta. La imagen no se envía
+a un servicio externo de OCR.
 
 ### 3. Compilar el Worker a un archivo `.exe` portable (Opcional)
 Para llevar el worker a cualquier PC sin necesidad de instalar Python:
 ```bash
-pip install pyinstaller
-pyinstaller --onefile --name "WorkerSUNARP" worker.py
+pip install -r requirements-worker.txt pyinstaller
+pyinstaller --onefile --name "WorkerSUNARP" --collect-all playwright --collect-all certifi --collect-all rapidocr_onnxruntime --collect-all onnxruntime --collect-all cv2 --collect-all PIL worker.py
 ```
 El archivo ejecutable generado quedará en la carpeta `dist/WorkerSUNARP.exe`.
 
