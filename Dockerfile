@@ -9,7 +9,7 @@ ENV CHROME_PROFILE=/tmp/chrome-profile
 
 # Chrome real + xvfb
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget xvfb \
+    wget xvfb x11-utils \
     && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get install -y --no-install-recommends /tmp/chrome.deb \
     && rm /tmp/chrome.deb \
