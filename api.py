@@ -20,6 +20,7 @@ Variables de entorno:
 """
 
 import asyncio
+import base64
 import hmac
 import logging
 import os
@@ -32,6 +33,13 @@ import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from psycopg.rows import dict_row
+
+try:
+    from ocr_parse import parse_tive_bytes
+    OCR_DISPONIBLE = True
+except Exception:
+    OCR_DISPONIBLE = False
+    log.warning("OCR no disponible: falta pytesseract/Pillow/ocr_parse.py")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("api")
@@ -262,6 +270,20 @@ async def procesar_consulta_sunarp(placa_raw: str) -> dict:
         raise HTTPException(502, f"Error en la consulta del worker: {exc}") from exc
 
     data = result.get("data", {})
+
+    # OCR sobre la imagen TIVE para extraer datos del vehiculo
+    model = data.get("model") or {}
+    img_b64 = model.get("imagen")
+    if img_b64 and OCR_DISPONIBLE:
+        try:
+            raw = base64.b64decode(img_b64)
+            ocr = await asyncio.to_thread(parse_tive_bytes, raw)
+            if ocr:
+                data = {**data, "ocr": ocr}
+                log.info("OCR OK: %d campos extraidos", len(ocr))
+        except Exception:
+            log.exception("Fallo el OCR de la imagen TIVE")
+
     return {"http": result.get("status"), "sunarp": data}
 
 

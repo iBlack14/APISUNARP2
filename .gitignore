@@ -15,6 +15,10 @@ captured_requests.json
 test_*.py
 check_*.py
 *.png
+tessdata/
+sample_*
+ocr_sample.py
+get_sample.py
 
 # PyInstaller & Build artifacts
 build/
