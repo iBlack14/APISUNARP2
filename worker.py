@@ -60,8 +60,10 @@ SSL_CONTEXT = get_ssl_context()
 # ---------------------------------------------------------------------------
 
 DEFAULT_VPS = "https://bot-sunarpapi.stkkft.easypanel.host"
+DEFAULT_SECRET = "J6mK8zV9xL4wQ2pA7rT1yU5iO3eB0sD-cN8vF2gH1jE"
+
 VPS_URL = os.environ.get("VPS_URL", DEFAULT_VPS).rstrip("/")
-WORKER_SECRET = os.environ.get("WORKER_SECRET", "mi_super_secreto_worker_123").strip()
+WORKER_SECRET = os.environ.get("WORKER_SECRET", DEFAULT_SECRET).strip()
 
 PAGE_URL = "https://consultavehicular.sunarp.gob.pe/consulta-vehicular/inicio"
 API_URL = (

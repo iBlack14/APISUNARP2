@@ -40,7 +40,7 @@ log = logging.getLogger("api")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 API_KEY = os.environ.get("API_KEY", "").strip()
-WORKER_SECRET = os.environ.get("WORKER_SECRET", "mi_super_secreto_worker_123").strip()
+WORKER_SECRET = os.environ.get("WORKER_SECRET", "J6mK8zV9xL4wQ2pA7rT1yU5iO3eB0sD-cN8vF2gH1jE").strip()
 
 RATE_LIMIT = 60
 RATE_WINDOW_SECONDS = 60
