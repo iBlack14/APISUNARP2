@@ -41,12 +41,14 @@ def norm(s: str) -> str:
 
 
 def parse_tive_image(img) -> dict:
-    """img: objeto PIL.Image o path a archivo."""
+    """img: objeto PIL.Image o path a archivo.
+    Devuelve {"campos": {...}, "lineas": [...], "texto": "..."} """
     if isinstance(img, (str, bytes)) and not hasattr(img, "size"):
         img = Image.open(img)
     data = pytesseract.image_to_data(
         img, lang="spa", output_type=pytesseract.Output.DICT
     )
+    texto_completo = pytesseract.image_to_string(img, lang="spa")
 
     # Agrupar palabras en lineas por coordenada 'top' (tolerancia 12px)
     words = []
@@ -119,7 +121,13 @@ def parse_tive_image(img) -> dict:
                         break
                 break
 
-    return result
+    lineas_texto = [line["text"] for line in lines if line["text"]]
+    return {
+        "campos": result,
+        "lineas": lineas_texto,
+        "texto": norm(texto_completo),
+    }
+
 def parse_tive_bytes(img_bytes: bytes) -> dict:
     from io import BytesIO
     return parse_tive_image(Image.open(BytesIO(img_bytes)))
