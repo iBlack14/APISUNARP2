@@ -9,8 +9,9 @@
 
 `GET /health` comprueba que la API responde. `GET /health/db` comprueba también
 la conexión con PostgreSQL y devuelve `503` si `DATABASE_URL` no está configurada
-o la base de datos no está disponible. El `HEALTHCHECK` de Docker usa este
-segundo endpoint.
+o la base de datos no está disponible. El `HEALTHCHECK` de Docker usa `/health`
+para comprobar el proceso sin reiniciarlo si PostgreSQL está temporalmente
+fuera de servicio.
 
 ---
 
@@ -25,15 +26,18 @@ Permite que tu servidor VPS (en AWS, DigitalOcean, etc.) esté disponible 24/7 p
 ```
 
 ### 1. En el VPS (Master)
-Arranca la API normalmente:
+Arranca la API Master; las consultas SUNARP se procesan solo en los Workers:
 ```bash
-uvicorn sunarp_api:app --host 0.0.0.0 --port 8000
+uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 Los endpoints disponibles son:
 - `POST /consulta` (público para clientes con `X-API-Key`)
 - `GET /worker/tarea` (para que los workers consulten placas pendientes)
 - `POST /worker/resultado` (para que los workers entreguen los datos)
 - `GET /worker/status` (ver cuántos workers y tareas hay activas)
+
+Si no hay un Worker activo, la consulta SUNARP responde `503`; el VPS no lanza
+Chrome ni intenta consultar SUNARP localmente.
 
 ### 2. En las PCs locales (Workers)
 En cada máquina en Perú (puedes tener 1, 2 o más PCs encendidas):

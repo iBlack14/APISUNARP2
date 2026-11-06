@@ -24,7 +24,6 @@ import hmac
 import logging
 import os
 import re
-import subprocess
 import threading
 import time
 import uuid
@@ -32,7 +31,6 @@ import uuid
 import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from playwright.async_api import async_playwright
 from psycopg.rows import dict_row
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -52,19 +50,6 @@ _rate_count = 0
 _task_queue = asyncio.Queue()
 _pending_tasks = {}  # task_id -> {"placa": str, "future": asyncio.Future, "created_at": float}
 _last_worker_seen = 0.0
-
-PAGE_URL = "https://consultavehicular.sunarp.gob.pe/consulta-vehicular/inicio"
-SUNARP_API_URL = (
-    "https://api-gateway.sunarp.gob.pe:9443/sunarp/multiservicios/"
-    "multiservicio-consvehicular/consulta/getDatosVehiculo"
-)
-IP_URL = "https://api.ipify.org/?format=json"
-CDP_PORT = int(os.environ.get("SUNARP_CDP_PORT", "9222"))
-CHROME_PATH = os.environ.get(
-    "CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-)
-CHROME_PROFILE = os.environ.get("CHROME_PROFILE", r"C:\chrome-debug-profile")
-SUNARP_CLIENT_ID = "70574c7d9194834316a156b1d68fdb90"
 
 app = FastAPI(title="API Consultas", version="1.0")
 
@@ -191,95 +176,6 @@ def reniec_por_dni(dni: str):
 
 # ---------------------------------------------------------------- SUNARP --
 
-_lock = asyncio.Lock()
-
-
-async def get_turnstile_token_cdp(page, timeout_s: int = 90) -> str:
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        token = await page.evaluate(
-            """() => {
-                const el = document.querySelector('[name="cf-turnstile-response"]');
-                return el && el.value ? el.value : null;
-            }"""
-        )
-        if token:
-            return token
-        await asyncio.sleep(2)
-    raise TimeoutError("Turnstile no genero token")
-
-
-async def sunarp_consultar(placa: str) -> dict:
-    """Fallback local: lanza Chrome real con CDP."""
-    chrome = subprocess.Popen([
-        CHROME_PATH,
-        f"--remote-debugging-port={CDP_PORT}",
-        f"--user-data-dir={CHROME_PROFILE}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        PAGE_URL,
-    ])
-    try:
-        await asyncio.sleep(6)
-        async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(
-                f"http://localhost:{CDP_PORT}"
-            )
-            context = browser.contexts[0]
-            page = context.pages[0] if context.pages else await context.new_page()
-            if PAGE_URL not in page.url:
-                await page.goto(
-                    PAGE_URL, wait_until="domcontentloaded", timeout=60000
-                )
-
-            token = await get_turnstile_token_cdp(page)
-            log.info("Turnstile token OK (%d chars)", len(token))
-
-            ip = await page.evaluate(
-                f"""async () => {{
-                    try {{
-                        const r = await fetch('{IP_URL}');
-                        const j = await r.json();
-                        return j.ip || '0.0.0.0';
-                    }} catch(e) {{ return '0.0.0.0'; }}
-                }}"""
-            )
-
-            body = {
-                "numPlaca": placa,
-                "regPubId": None,
-                "oficRegId": None,
-                "ipAddress": ip,
-                "appVersion": "1.0",
-                "dG9rZW4": token,
-            }
-            result = await page.evaluate(
-                """async ({url, body, clientId}) => {
-                    const r = await fetch(url, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'x-ibm-client-id': clientId,
-                        },
-                        body: JSON.stringify(body),
-                    });
-                    return {status: r.status, data: await r.json()};
-                }""",
-                {
-                    "url": SUNARP_API_URL,
-                    "body": body,
-                    "clientId": SUNARP_CLIENT_ID,
-                },
-            )
-            await browser.close()
-            return result
-    finally:
-        chrome.terminate()
-
-
 class SunarpIn(BaseModel):
     placa: str
 
@@ -346,35 +242,24 @@ async def procesar_consulta_sunarp(placa_raw: str) -> dict:
         raise HTTPException(400, "Placa invalida")
 
     now = time.time()
-    # Si hay un worker activo en los últimos 45 segundos, delegamos al worker
-    if (now - _last_worker_seen) < 45.0:
-        task_id = str(uuid.uuid4())
-        loop = asyncio.get_event_loop()
-        future = loop.create_future()
-        _pending_tasks[task_id] = {"placa": placa, "future": future, "created_at": now}
-        await _task_queue.put(task_id)
-        log.info("Tarea %s asignada a la cola de workers para placa %s", task_id, placa)
+    if (now - _last_worker_seen) >= 45.0:
+        raise HTTPException(503, "Worker SUNARP no disponible.")
 
-        try:
-            result = await asyncio.wait_for(future, timeout=90.0)
-        except asyncio.TimeoutError:
-            _pending_tasks.pop(task_id, None)
-            raise HTTPException(504, "El worker no respondio en el tiempo limite (90s).")
-        except Exception as exc:
-            log.exception("Error reportado por el worker")
-            raise HTTPException(502, f"Error en la consulta del worker: {exc}")
-    else:
-        # Fallback local
-        async with _lock:
-            try:
-                result = await sunarp_consultar(placa)
-            except TimeoutError as exc:
-                raise HTTPException(
-                    504, "Tiempo de espera agotado al consultar SUNARP."
-                ) from exc
-            except Exception:
-                log.exception("Error en consulta SUNARP")
-                raise HTTPException(502, "Error consultando SUNARP.")
+    task_id = str(uuid.uuid4())
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    _pending_tasks[task_id] = {"placa": placa, "future": future, "created_at": now}
+    await _task_queue.put(task_id)
+    log.info("Tarea %s asignada a la cola de workers para placa %s", task_id, placa)
+
+    try:
+        result = await asyncio.wait_for(future, timeout=90.0)
+    except asyncio.TimeoutError as exc:
+        _pending_tasks.pop(task_id, None)
+        raise HTTPException(504, "El worker no respondio en el tiempo limite (90s).") from exc
+    except Exception as exc:
+        log.exception("Error reportado por el worker")
+        raise HTTPException(502, f"Error en la consulta del worker: {exc}") from exc
 
     data = result.get("data", {})
     model = data.get("model") or {}
