@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -97,17 +98,6 @@ def _normalize_ocr_text(value: str) -> tuple[str, list[int]]:
 
 
 _OCR_LABELS = {
-    "placa_anterior": ("PLACAANTERIOR",),
-    "placa_vigente": ("PLACAVIGENTE",),
-    "propietarios": ("PROPIETARIOS", "PROPIETARIO"),
-    "anio_fabricacion": ("ANODEFABRICACION", "ANODEFAB", "ANIODEFAB"),
-    "anio_modelo": ("ANODEMODELO", "ANODEM0DELO", "ANOMODELO"),
-    "numero_partida": ("NUMERODEPARTIDA", "NPARTIDA"),
-    "categoria": ("CATEGORIA",),
-    "cilindrada": ("CILINDRADA",),
-    "combustible": ("COMBUSTIBLE",),
-    "carroceria": ("CARROCERIA",),
-    "potencia": ("POTENCIA",),
     "numero_placa": ("NPLACA", "PLACAN"),
     "numero_serie": ("NSERIE", "SERIE"),
     "numero_vin": ("NVIN", "VIN"),
@@ -118,7 +108,33 @@ _OCR_LABELS = {
     "marca": ("MARCA",),
     "color": ("COLOR",),
     "sede": ("SEDE",),
+    "placa_vigente": ("PLACAVIGENTE",),
+    "placa_anterior": ("PLACAANTERIOR",),
+    "anio_modelo": ("ANODEMODELO", "ANODEM0DELO", "ANOMODELO"),
+    "anio_fabricacion": ("ANODEFABRICACION", "ANODEFAB", "ANIODEFAB"),
+    "categoria": ("CATEGORIA",),
+    "carroceria": ("CARROCERIA",),
+    "potencia": ("POTENCIA",),
+    "cilindrada": ("CILINDRADA",),
+    "combustible": ("COMBUSTIBLE",),
+    "numero_partida": ("NUMERODEPARTIDA", "NPARTIDA"),
+    "formula_rodante": ("FORMULARODANTE", "FORMULAROD"),
+    "peso_bruto": ("PESOBRUTO", "PB"),
+    "peso_neto": ("PESONETO", "PN"),
+    "carga_util": ("CARGAUTIL",),
+    "longitud": ("LONGITUD",),
+    "ancho": ("ANCHO",),
+    "altura": ("ALTURA",),
+    "numero_ejes": ("NUMERODEEJES", "NEJES", "EJES"),
+    "numero_ruedas": ("NUMERODERUEDAS", "NRUEDAS", "RUEDAS"),
+    "numero_asientos": ("NUMERODEASIENTOS", "NASIENTOS", "ASIENTOS"),
+    "numero_pasajeros": ("NUMERODEPASAJEROS", "NPASAJEROS", "PASAJEROS"),
+    "numero_cilindros": ("NUMERODECILINDROS", "NCILINDROS", "CILINDROS"),
+    "propietarios": ("PROPIETARIOS", "PROPIETARIO"),
 }
+
+_OCR_FIELD_ORDER = tuple(_OCR_LABELS)
+_OCR_WATERMARK_WORDS = {"ESTA", "PUB", "PUBLICOS", "SUNARP", "SUR"}
 
 
 def _ocr_label_and_value(text: str) -> tuple[str | None, str]:
@@ -126,48 +142,91 @@ def _ocr_label_and_value(text: str) -> tuple[str | None, str]:
     for field, aliases in _OCR_LABELS.items():
         for alias in aliases:
             if normalized.startswith(alias):
-                end = positions[len(alias)] if len(positions) > len(alias) else len(text)
-                return field, text[end:].lstrip(" \t:;.-")
+                end = positions[len(alias) - 1] + 1
+                suffix = text[end:]
+                if suffix and suffix[0] not in " \t:;([{":
+                    continue
+                suffix = re.sub(r"^\(S\)\s*:?\s*", "", suffix, flags=re.IGNORECASE)
+                return field, suffix.lstrip(" \t:;.-()")
     return None, ""
+
+
+def _clean_ocr_candidate(text: str) -> str:
+    if re.search(r"\d{1,2}/\d{1,2}/\d{4}", text):
+        return ""
+    words = text.split()
+    cleaned = [word for word in words if _normalize_ocr_text(word)[0] not in _OCR_WATERMARK_WORDS]
+    value = " ".join(cleaned).strip(" \t:;.-")
+    normalized, _ = _normalize_ocr_text(value)
+    if not normalized or "REALIZAROTRABUSQUEDA" in normalized:
+        return ""
+    return value
+
+
+def _select_ocr_value(field: str, candidates: list[str]) -> str | list[str] | None:
+    values = [_clean_ocr_candidate(value) for value in candidates]
+    values = [value for value in values if value]
+    if not values:
+        return None
+
+    if field in {"numero_placa", "placa_vigente", "placa_anterior"}:
+        matches = [
+            match.group(0)
+            for value in values
+            for match in re.finditer(r"(?<![A-Z0-9])[A-Z0-9]{4,8}(?![A-Z0-9])", value.upper())
+        ]
+        if matches:
+            return max(matches, key=len)
+        return max(values, key=lambda value: len(_normalize_ocr_text(value)[0]))
+
+    if field in {"anio_modelo", "anio_fabricacion"}:
+        years = [
+            match.group(0)
+            for value in values
+            for match in re.finditer(r"\b(?:19|20)\d{2}\b", value)
+        ]
+        if years:
+            return years[-1]
+
+    if field in {"numero_serie", "numero_vin", "numero_motor", "numero_partida"}:
+        return max(values, key=lambda value: len(_normalize_ocr_text(value)[0]))
+
+    if field == "propietarios":
+        return [values[0]]
+
+    return " ".join(values)
 
 
 def parse_vehicle_ocr_texts(texts: list[str]) -> dict[str, str | list[str]]:
     fields: dict[str, str | list[str]] = {}
-    pending_field = None
+    pending_field: str | None = None
+    pending_values: list[str] = []
 
-    def save_field(field: str, value: str) -> None:
-        if field == "propietarios":
-            fields[field] = [value]
-        else:
-            fields[field] = value
+    def save_pending_field() -> None:
+        if pending_field is None:
+            return
+        value = _select_ocr_value(pending_field, pending_values)
+        if value is not None:
+            fields[pending_field] = value
 
     for text in texts:
-        if pending_field:
-            normalized, _ = _normalize_ocr_text(text)
-            exact_label = any(
-                normalized == alias
-                for aliases in _OCR_LABELS.values()
-                for alias in aliases
-            )
-            if not exact_label and text.strip():
-                save_field(pending_field, text.strip())
-                pending_field = None
-                continue
-
         field, value = _ocr_label_and_value(text)
         if field:
-            if value:
-                save_field(field, value.strip())
-                pending_field = None
-            else:
-                pending_field = field
+            save_pending_field()
+            pending_field = field
+            pending_values = [value] if value else []
             continue
 
         if pending_field and text.strip():
-            save_field(pending_field, text.strip())
-            pending_field = None
+            pending_values.append(text.strip())
 
-    return fields
+    save_pending_field()
+
+    return {
+        field: fields[field]
+        for field in _OCR_FIELD_ORDER
+        if field in fields
+    }
 
 
 def reconocer_imagen_vehicular(image_data: str) -> dict:
@@ -193,20 +252,21 @@ def reconocer_imagen_vehicular(image_data: str) -> dict:
         results, _ = _OCR_ENGINE(image_array)
         texts = [str(item[1]).strip() for item in (results or []) if item[1]]
         if not texts:
-            return {"estado": "sin_texto", "campos": {}, "texto": ""}
+            return {"estado": "sin_texto", "campos": {}, "lineas": [], "texto": ""}
 
         fields = parse_vehicle_ocr_texts(texts)
         return {
             "estado": "ok" if fields else "sin_campos",
             "campos": fields,
+            "lineas": texts,
             "texto": "\n".join(texts),
         }
     except (binascii.Error, ValueError) as exc:
         log.exception("La imagen recibida de SUNARP no se pudo interpretar")
-        return {"estado": "error", "mensaje": str(exc), "campos": {}, "texto": ""}
+        return {"estado": "error", "mensaje": str(exc), "campos": {}, "lineas": [], "texto": ""}
     except Exception as exc:
         log.exception("Falló el OCR local de la imagen de SUNARP")
-        return {"estado": "error", "mensaje": str(exc), "campos": {}, "texto": ""}
+        return {"estado": "error", "mensaje": str(exc), "campos": {}, "lineas": [], "texto": ""}
 
 
 def agregar_ocr_a_resultado(result: dict) -> dict:

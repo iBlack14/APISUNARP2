@@ -56,7 +56,12 @@ En cada máquina en Perú (puedes tener 1, 2 o más PCs encendidas):
    ```
 El worker aplica OCR localmente a la imagen devuelta por SUNARP y agrega
 `sunarp.ocr.campos` y `sunarp.ocr.texto` a la respuesta. La imagen no se envía
-a un servicio externo de OCR.
+a un servicio externo de OCR. `campos` incluye los datos vehiculares reconocidos
+(identificación, marca/modelo, dimensiones, pesos y otros cuando aparecen);
+`lineas` conserva cada línea detectada y `texto` las reúne para facilitar la
+revisión. Los valores separados se agrupan, se ignoran marcas de agua y la salida
+conserva un orden estable. El OCR solo puede incluir datos que logre leer en la
+imagen recibida.
 
 ### 3. Compilar el Worker a un archivo `.exe` portable (Opcional)
 Para llevar el worker a cualquier PC sin necesidad de instalar Python:
