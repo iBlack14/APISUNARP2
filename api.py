@@ -17,6 +17,7 @@ import hmac
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
 
@@ -43,6 +44,12 @@ SUNARP_API_URL = (
     "multiservicio-consvehicular/consulta/getDatosVehiculo"
 )
 IP_URL = "https://api.ipify.org/?format=json"
+CDP_PORT = int(os.environ.get("SUNARP_CDP_PORT", "9222"))
+CHROME_PATH = os.environ.get(
+    "CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+)
+CHROME_PROFILE = os.environ.get("CHROME_PROFILE", r"C:\chrome-debug-profile")
+SUNARP_CLIENT_ID = "70574c7d9194834316a156b1d68fdb90"
 
 app = FastAPI(title="API Consultas", version="1.0")
 
@@ -160,106 +167,90 @@ def reniec_por_dni(dni: str):
 # ---------------------------------------------------------------- SUNARP --
 
 _lock = asyncio.Lock()
-_browser = None
-_pw = None
 
 
-async def get_browser():
-    global _browser, _pw
-    if _browser is None or not _browser.is_connected():
-        _pw = await async_playwright().start()
-        _browser = await _pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--window-size=1366,768",
-            ],
-        )
-    return _browser
-
-
-async def get_turnstile_token(page, timeout_s: int = 90) -> str:
+async def get_turnstile_token_cdp(page, timeout_s: int = 90) -> str:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout_s
-    clicked = False
     while loop.time() < deadline:
         token = await page.evaluate(
             """() => {
                 const el = document.querySelector('[name="cf-turnstile-response"]');
-                if (el && el.value) return el.value;
-                const inputs = document.querySelectorAll('input[type="hidden"], textarea');
-                for (const i of inputs) {
-                    if (i.value && i.value.length > 100) return i.value;
-                }
-                return null;
+                return el && el.value ? el.value : null;
             }"""
         )
         if token:
             return token
-        if not clicked and loop.time() > deadline - timeout_s + 8:
-            clicked = True
-            try:
-                frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
-                await frame.locator('input[type="checkbox"], .cb-lb, body').first.click(timeout=3000)
-                log.info("Click en widget Turnstile ejecutado")
-            except Exception as e:
-                log.info("No se pudo clickear Turnstile: %s", e)
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
     raise TimeoutError("Turnstile no genero token")
 
 
 async def sunarp_consultar(placa: str) -> dict:
-    browser = await get_browser()
-    context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1366, "height": 768},
-        locale="es-PE",
-    )
-    page = await context.new_page()
+    """Lanza Chrome real con CDP y conecta Playwright (evita deteccion Turnstile)."""
+    chrome = subprocess.Popen([
+        CHROME_PATH,
+        f"--remote-debugging-port={CDP_PORT}",
+        f"--user-data-dir={CHROME_PROFILE}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        PAGE_URL,
+    ])
     try:
-        await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
-        token = await get_turnstile_token(page)
-        log.info("Turnstile token OK (%d chars)", len(token))
+        await asyncio.sleep(6)
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(
+                f"http://localhost:{CDP_PORT}"
+            )
+            context = browser.contexts[0]
+            page = context.pages[0] if context.pages else await context.new_page()
+            if PAGE_URL not in page.url:
+                await page.goto(
+                    PAGE_URL, wait_until="domcontentloaded", timeout=60000
+                )
 
-        ip = await page.evaluate(
-            f"""async () => {{
-                try {{
-                    const r = await fetch('{IP_URL}');
-                    const j = await r.json();
-                    return j.ip || '0.0.0.0';
-                }} catch(e) {{ return '0.0.0.0'; }}
-            }}"""
-        )
+            token = await get_turnstile_token_cdp(page)
+            log.info("Turnstile token OK (%d chars)", len(token))
 
-        body = {
-            "numPlaca": placa,
-            "regPubId": None,
-            "oficRegId": None,
-            "ipAddress": ip,
-            "appVersion": "1.0",
-            "dG9rZW4": token,
-        }
-        result = await page.evaluate(
-            """async ({url, body}) => {
-                const r = await fetch(url, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(body),
-                });
-                return {status: r.status, data: await r.json()};
-            }""",
-            {"url": SUNARP_API_URL, "body": body},
-        )
-        return result
+            ip = await page.evaluate(
+                f"""async () => {{
+                    try {{
+                        const r = await fetch('{IP_URL}');
+                        const j = await r.json();
+                        return j.ip || '0.0.0.0';
+                    }} catch(e) {{ return '0.0.0.0'; }}
+                }}"""
+            )
+
+            body = {
+                "numPlaca": placa,
+                "regPubId": None,
+                "oficRegId": None,
+                "ipAddress": ip,
+                "appVersion": "1.0",
+                "dG9rZW4": token,
+            }
+            result = await page.evaluate(
+                """async ({url, body, clientId}) => {
+                    const r = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'x-ibm-client-id': clientId,
+                        },
+                        body: JSON.stringify(body),
+                    });
+                    return {status: r.status, data: await r.json()};
+                }""",
+                {
+                    "url": SUNARP_API_URL,
+                    "body": body,
+                    "clientId": SUNARP_CLIENT_ID,
+                },
+            )
+            await browser.close()
+            return result
     finally:
-        await context.close()
+        chrome.terminate()
 
 
 class SunarpIn(BaseModel):
@@ -298,11 +289,7 @@ def health():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _browser, _pw
-    if _browser:
-        await _browser.close()
-    if _pw:
-        await _pw.stop()
+    pass
 
 
 if __name__ == "__main__":

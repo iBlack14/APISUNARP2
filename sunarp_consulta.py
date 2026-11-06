@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Consulta vehicular SUNARP automatizada con Playwright.
+Consulta vehicular SUNARP automatizada.
 
-Flujo:
-  1. Abre la pagina real en Chromium
-  2. Espera a que Cloudflare Turnstile genere el token
-  3. Extrae el token y la IP publica
-  4. Llama getDatosVehiculo via fetch dentro de la pagina (mismo Origin)
-  5. Devuelve el JSON de respuesta
+Metodo: lanza Chrome REAL con remote debugging (CDP) y conecta Playwright.
+Esto evita la deteccion de automatizacion de Cloudflare Turnstile.
 
 Uso:
-    python sunarp_consulta.py <placa> [--headless] [--timeout 60]
+    python sunarp_consulta.py <placa> [--timeout 90]
 """
 
 import argparse
 import asyncio
 import json
+import subprocess
 import sys
 
 from playwright.async_api import async_playwright
@@ -26,107 +23,99 @@ API_URL = (
     "multiservicio-consvehicular/consulta/getDatosVehiculo"
 )
 IP_URL = "https://api.ipify.org/?format=json"
+CDP_PORT = 9222
+CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+CHROME_PROFILE = r"C:\chrome-debug-profile"
 
 
-async def get_turnstile_token(page, timeout_s: int) -> str:
-    """Espera a que Turnstile llene el input cf-turnstile-response."""
+async def get_token_cdp(page, timeout_s: int) -> str:
+    """Espera el token Turnstile en una pagina ya abierta via CDP."""
     deadline = asyncio.get_event_loop().time() + timeout_s
     while asyncio.get_event_loop().time() < deadline:
         token = await page.evaluate(
             """() => {
-                const el = document.querySelector(
-                    'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
-                ) || document.querySelector('[name="cf-turnstile-response"]');
-                if (el && el.value) return el.value;
-                // fallback: buscar en window.turnstile o inputs ocultos
-                const inputs = document.querySelectorAll('input[type="hidden"]');
-                for (const i of inputs) {
-                    if (i.value && i.value.length > 100) return i.value;
-                }
-                return null;
+                const el = document.querySelector('[name="cf-turnstile-response"]');
+                return el && el.value ? el.value : null;
             }"""
         )
         if token:
             return token
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
     raise TimeoutError("Turnstile no genero token en el tiempo limite")
 
 
-async def consultar_placa(placa: str, headless: bool, timeout_s: int) -> dict:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
-        )
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 768},
-            locale="es-PE",
-        )
-        page = await context.new_page()
+async def consultar_placa(placa: str, timeout_s: int) -> dict:
+    chrome = subprocess.Popen([
+        CHROME_PATH,
+        f"--remote-debugging-port={CDP_PORT}",
+        f"--user-data-dir={CHROME_PROFILE}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        PAGE_URL,
+    ])
+    try:
+        await asyncio.sleep(6)
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(f"http://localhost:{CDP_PORT}")
+            context = browser.contexts[0]
+            page = context.pages[0] if context.pages else await context.new_page()
+            if PAGE_URL not in page.url:
+                await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
 
-        print(f"[*] Abriendo {PAGE_URL}")
-        await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+            print("[*] Esperando token de Cloudflare Turnstile...")
+            token = await get_token_cdp(page, timeout_s)
+            print(f"[+] Token obtenido ({len(token)} chars)")
 
-        print("[*] Esperando token de Cloudflare Turnstile...")
-        token = await get_turnstile_token(page, timeout_s)
-        print(f"[+] Token obtenido ({len(token)} chars)")
+            ip = await page.evaluate(
+                f"""async () => {{
+                    try {{
+                        const r = await fetch('{IP_URL}');
+                        const j = await r.json();
+                        return j.ip || '0.0.0.0';
+                    }} catch(e) {{ return '0.0.0.0'; }}
+                }}"""
+            )
+            print(f"[*] IP detectada: {ip}")
 
-        # Obtener IP publica igual que la app
-        ip = await page.evaluate(
-            f"""async () => {{
-                try {{
-                    const r = await fetch('{IP_URL}');
-                    const j = await r.json();
-                    return j.ip || '0.0.0.0';
-                }} catch(e) {{ return '0.0.0.0'; }}
-            }}"""
-        )
-        print(f"[*] IP detectada: {ip}")
+            placa_clean = placa.strip().upper().replace(" ", "")
+            body = {
+                "numPlaca": placa_clean,
+                "regPubId": None,
+                "oficRegId": None,
+                "ipAddress": ip,
+                "appVersion": "1.0",
+                "dG9rZW4": token,
+            }
 
-        placa_clean = placa.strip().upper().replace(" ", "")
-        body = {
-            "numPlaca": placa_clean,
-            "regPubId": None,
-            "oficRegId": None,
-            "ipAddress": ip,
-            "appVersion": "1.0",
-            "dG9rZW4": token,
-        }
-
-        print(f"[*] Consultando placa {placa_clean}...")
-        result = await page.evaluate(
-            """async ({url, body}) => {
-                const r = await fetch(url, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(body),
-                });
-                return {status: r.status, data: await r.json()};
-            }""",
-            {"url": API_URL, "body": body},
-        )
-
-        await browser.close()
-        return result
+            print(f"[*] Consultando placa {placa_clean}...")
+            result = await page.evaluate(
+                """async ({url, body}) => {
+                    const r = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'x-ibm-client-id': '70574c7d9194834316a156b1d68fdb90',
+                        },
+                        body: JSON.stringify(body),
+                    });
+                    return {status: r.status, data: await r.json()};
+                }""",
+                {"url": API_URL, "body": body},
+            )
+            await browser.close()
+            return result
+    finally:
+        chrome.terminate()
 
 
 async def main():
     p = argparse.ArgumentParser()
     p.add_argument("placa", help="Placa vehicular, ej: ABC123 o 1274UP")
-    p.add_argument("--headless", action="store_true", help="Ejecutar sin ventana")
-    p.add_argument("--timeout", type=int, default=60, help="Timeout Turnstile (s)")
+    p.add_argument("--timeout", type=int, default=90, help="Timeout Turnstile (s)")
     args = p.parse_args()
 
     try:
-        result = await consultar_placa(args.placa, args.headless, args.timeout)
+        result = await consultar_placa(args.placa, args.timeout)
     except TimeoutError as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(2)
@@ -135,11 +124,9 @@ async def main():
         sys.exit(1)
 
     data = result.get("data", {})
-    # Resumen legible
     print(f"\nHTTP {result.get('status')} | cod={data.get('cod')} | {data.get('mensaje')}")
     model = data.get("model") or {}
     if model:
-        # Mostrar campos excepto la imagen gigante
         resumen = {k: v for k, v in model.items() if k != "imagen"}
         print(json.dumps(resumen, ensure_ascii=False, indent=2))
         if "imagen" in model:
